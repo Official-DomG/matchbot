@@ -61,9 +61,12 @@ def fetch_table_ratings(league_id: int):
     url = f"https://www.thesportsdb.com/api/v1/json/123/lookuptable.php?l={league_id}"
     r = requests.get(url, timeout=20)
     r.raise_for_status()
-    table = (r.json() or {}).get("table") or []
-    if not table:
-        return {}
+    table = try:
+    data = if r.status_code != 200:
+    raise RuntimeError(f"API failed {r.status_code}: {r.text[:200]}") r.json()
+except Exception:
+    print("API returned non-JSON:", r.text[:200])
+    return {}
 
     rows = []
     for t in table:
