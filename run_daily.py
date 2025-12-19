@@ -46,9 +46,15 @@ def safe_int(x):
 
 def fetch_next_events(league_id: int):
     url = f"https://www.thesportsdb.com/api/v1/json/1/eventsnextleague.php?id={league_id}"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return (r.json() or {}).get("events") or []
+    try:
+        r = requests.get(url, timeout=20)
+        if r.status_code != 200:
+            print(f"Events API returned {r.status_code} for league {league_id}")
+            return []
+        return (r.json() or {}).get("events") or []
+    except Exception as e:
+        print(f"Failed to fetch events for league {league_id}: {e}")
+        return []
 
 def fetch_table_ratings(league_id: int):
     url = f"https://www.thesportsdb.com/api/v1/json/1/lookuptable.php?l={league_id}"
