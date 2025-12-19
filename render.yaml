@@ -1,0 +1,14 @@
+services:
+  - type: cron
+    name: matchbot-daily
+    env: python
+    schedule: "0 9 * * *"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python run_daily.py"
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: ODDS_API_KEY
+        sync: false
