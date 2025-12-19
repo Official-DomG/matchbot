@@ -3,7 +3,8 @@ import math
 import requests
 import pandas as pd
 import pytz
-from datetime import datetime, timedelta
+from datetime 
+import datetime, timedelta
 
 LONDON = pytz.timezone("Europe/London")
 UTC = pytz.utc
