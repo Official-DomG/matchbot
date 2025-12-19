@@ -6,6 +6,15 @@ import pandas as pd
 import pytz
 from datetime import datetime, timedelta
 
+def get_json_or_none(r):
+    # Avoid crashing when API returns HTML/empty/etc.
+    try:
+        return r.json()
+    except Exception:
+        preview = (r.text or "")[:200].replace("\n", " ")
+        print(f"Non-JSON response ({r.status_code}): {preview}")
+        return None
+
 LONDON = pytz.timezone("Europe/London")
 UTC = pytz.utc
 
@@ -47,26 +56,33 @@ def safe_int(x):
 
 def fetch_next_events(league_id: int):
     url = f"https://www.thesportsdb.com/api/v1/json/123/eventsnextleague.php?id={league_id}"
-    try:
-        r = requests.get(url, timeout=20)
-        if r.status_code != 200:
-            print(f"Events API returned {r.status_code} for league {league_id}")
-            return []
-        return (r.json() or {}).get("events") or []
-    except Exception as e:
-        print(f"Failed to fetch events for league {league_id}: {e}")
+    r = requests.get(url, timeout=20)
+
+    if r.status_code != 200:
+        print(f"Events API failed {r.status_code} for league {league_id}: {url}")
         return []
+
+    data = get_json_or_none(r)
+    if not data:
+        return []
+
+    return (data or {}).get("events") or []
 
 def fetch_table_ratings(league_id: int):
     url = f"https://www.thesportsdb.com/api/v1/json/123/lookuptable.php?l={league_id}"
     r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    table = try:
-    data = if r.status_code != 200:
-    raise RuntimeError(f"API failed {r.status_code}: {r.text[:200]}") r.json()
-except Exception:
-    print("API returned non-JSON:", r.text[:200])
-    return {}
+
+    if r.status_code != 200:
+        print(f"Table API failed {r.status_code} for league {league_id}: {url}")
+        return {}
+
+    data = get_json_or_none(r)
+    if not data:
+        return {}
+
+    table = (data or {}).get("table") or []
+    if not table:
+        return {}
 
     rows = []
     for t in table:
@@ -89,6 +105,7 @@ except Exception:
         elo = 1500 + (ppg - avg_ppg) * 420 + (gdpg - avg_gdpg) * 65
         elo = max(1200, min(1800, elo))
         ratings[team] = float(elo)
+
     return ratings
 
 def parse_event_dt_utc(date_str: str, time_str: str):
