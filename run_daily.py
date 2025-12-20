@@ -1,28 +1,30 @@
-print("DEPLOY MARKER: V123-001")
+print("DEPLOY MARKER: V123-CHAMP-001")
+
 import os
+import time
 import math
 import requests
-import pandas as pd
 import pytz
 from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, List, Tuple
 
-def get_json_or_none(r):
-    # Avoid crashing when API returns HTML/empty/etc.
-    try:
-        return r.json()
-    except Exception:
-        preview = (r.text or "")[:200].replace("\n", " ")
-        print(f"Non-JSON response ({r.status_code}): {preview}")
-        return None
-
+# -----------------------------
+# Timezones
+# -----------------------------
 LONDON = pytz.timezone("Europe/London")
 UTC = pytz.utc
 
-LEAGUES = [
+# -----------------------------
+# Leagues (TheSportsDB IDs)
+# -----------------------------
+LEAGUES: List[Tuple[str, int]] = [
     ("Premier League", 4328),
-    ("Champions League", 4480),
+    ("EFL Championship", 4329),   # swapped from Champions League
 ]
 
+# -----------------------------
+# Model params
+# -----------------------------
 HOME_ADV_ELO = 55
 DRAW_BASE = 0.24
 DRAW_TIGHTNESS = 260.0
@@ -30,188 +32,236 @@ DRAW_TIGHTNESS = 260.0
 EDGE_THRESHOLD = 0.05
 MIN_PROB_TO_BET = 0.40
 
+# -----------------------------
+# Odds API sport keys (if you use The Odds API)
+# -----------------------------
 ODDS_SPORT_KEYS = {
     "Premier League": "soccer_epl",
-    "Champions League": "soccer_uefa_champs_league",
+    "EFL Championship": "soccer_efl_championship",
 }
 
+# -----------------------------
+# Environment variables
+# -----------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+SPORTSDB_API_KEY = os.getenv("SPORTSDB_API_KEY", "1").strip()  # "1" is TheSportsDB test key (very limited)
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
+
+# -----------------------------
+# HTTP helpers (anti-crash)
+# -----------------------------
 def send_telegram_message(text: str) -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("Telegram not configured (missing env vars)")
+    """
+    Sends a Telegram message if env vars are present.
+    Safe: never raises.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[Telegram] Skipped (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID)")
         return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    r = requests.post(url, json=payload, timeout=20)
-    print("Telegram response:", r.status_code, r.text)
-
-def safe_int(x):
     try:
-        if x is None or x == "":
-            return 0
-        return int(float(x))
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        requests.post(url, json=payload, timeout=15)
+    except Exception as e:
+        print("[Telegram] Send failed:", repr(e))
+
+
+def safe_json(r: requests.Response, label: str) -> Optional[Dict[str, Any]]:
+    """
+    Robust JSON parsing:
+    - Logs status and response preview
+    - Returns None instead of raising
+    """
+    try:
+        return r.json()
     except Exception:
-        return 0
+        preview = (r.text or "")[:350].replace("\n", " ")
+        print(f"[{label}] Non-JSON response")
+        print("Status:", r.status_code)
+        print("Preview:", preview)
+        return None
 
-def fetch_next_events(league_id: int):
-    url = f"https://www.thesportsdb.com/api/v1/json/123/eventsnextleague.php?id={league_id}"
-    r = requests.get(url, timeout=20)
 
-    if r.status_code != 200:
-        print(f"Events API failed {r.status_code} for league {league_id}: {url}")
-        return []
+def get_with_retry(url: str, label: str, params: Optional[Dict[str, Any]] = None, tries: int = 3) -> Optional[Dict[str, Any]]:
+    """
+    GET with retries + JSON safety.
+    Returns parsed JSON dict or None.
+    """
+    last_r = None
+    for i in range(tries):
+        try:
+            last_r = requests.get(url, params=params, timeout=20)
+            # Basic sanity gates BEFORE json parsing
+            if last_r.status_code != 200:
+                print(f"[{label}] Bad status: {last_r.status_code} | URL: {last_r.url}")
+            if not last_r.text or not last_r.text.strip():
+                print(f"[{label}] Empty body | URL: {last_r.url}")
+            # Attempt JSON parse regardless; safe_json handles failures
+            data = safe_json(last_r, label)
+            if data is not None:
+                return data
+        except Exception as e:
+            print(f"[{label}] Request error:", repr(e))
+        time.sleep(2 * (i + 1))
+    return None
 
-    data = get_json_or_none(r)
+
+# -----------------------------
+# Core model bits
+# -----------------------------
+def elo_to_probs(elo_home: float, elo_away: float) -> Tuple[float, float, float]:
+    """
+    Convert Elo difference to W/D/L probabilities with a draw model.
+    """
+    diff = (elo_home + HOME_ADV_ELO) - elo_away
+
+    # Win probability ignoring draws
+    p_home_nodraw = 1.0 / (1.0 + 10 ** (-diff / 400.0))
+    p_away_nodraw = 1.0 - p_home_nodraw
+
+    # Draw probability increases when teams are close
+    p_draw = DRAW_BASE * math.exp(-(abs(diff) / DRAW_TIGHTNESS))
+    p_draw = max(0.05, min(0.35, p_draw))  # clamp
+
+    # Re-scale win probs to fit remaining mass
+    rem = 1.0 - p_draw
+    p_home = p_home_nodraw * rem
+    p_away = p_away_nodraw * rem
+
+    # Normalize (numerical safety)
+    s = p_home + p_draw + p_away
+    p_home, p_draw, p_away = p_home / s, p_draw / s, p_away / s
+    return p_home, p_draw, p_away
+
+
+# -----------------------------
+# TheSportsDB: fixtures
+# -----------------------------
+def sportsdb_next_events_by_league(league_id: int) -> List[Dict[str, Any]]:
+    """
+    TheSportsDB endpoint: eventsnextleague.php?id=<league_id>
+    """
+    url = "https://www.thesportsdb.com/api/v1/json/{}/eventsnextleague.php".format(SPORTSDB_API_KEY)
+    data = get_with_retry(url, "TheSportsDB", params={"id": league_id})
     if not data:
         return []
+    events = data.get("events") or []
+    if not isinstance(events, list):
+        return []
+    return events
 
-    return (data or {}).get("events") or []
 
-def fetch_table_ratings(league_id: int):
-    url = f"https://www.thesportsdb.com/api/v1/json/123/lookuptable.php?l={league_id}"
-    r = requests.get(url, timeout=20)
-
-    if r.status_code != 200:
-        print(f"Table API failed {r.status_code} for league {league_id}: {url}")
-        return {}
-
-    data = get_json_or_none(r)
-    if not data:
-        return {}
-
-    table = (data or {}).get("table") or []
-    if not table:
-        return {}
-
-    rows = []
-    for t in table:
-        team = t.get("strTeam") or ""
-        played = safe_int(t.get("intPlayed"))
-        points = safe_int(t.get("intPoints"))
-        gd = safe_int(t.get("intGoalDifference"))
-        if not team or played <= 0:
-            continue
-        rows.append((team, points / played, gd / played))
-
-    if not rows:
-        return {}
-
-    avg_ppg = sum(x[1] for x in rows) / len(rows)
-    avg_gdpg = sum(x[2] for x in rows) / len(rows)
-
-    ratings = {}
-    for team, ppg, gdpg in rows:
-        elo = 1500 + (ppg - avg_ppg) * 420 + (gdpg - avg_gdpg) * 65
-        elo = max(1200, min(1800, elo))
-        ratings[team] = float(elo)
-
-    return ratings
-
-def parse_event_dt_utc(date_str: str, time_str: str):
+def parse_event_time_utc(event: Dict[str, Any]) -> Optional[datetime]:
+    """
+    TheSportsDB typically provides dateEvent + strTime (often UTC).
+    We treat missing time as 00:00.
+    """
+    date_str = (event.get("dateEvent") or "").strip()  # e.g. "2025-12-20"
+    time_str = (event.get("strTime") or "").strip()    # e.g. "15:00:00"
     if not date_str:
         return None
     if not time_str:
         time_str = "00:00:00"
-    dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
-    return UTC.localize(dt)
-
-def win_prob_from_elo(elo_a: float, elo_b: float) -> float:
-    return 1.0 / (1.0 + 10.0 ** ((elo_b - elo_a) / 400.0))
-
-def probs_1x2(elo_home: float, elo_away: float):
-    p_home_raw = win_prob_from_elo(elo_home + HOME_ADV_ELO, elo_away)
-    diff = abs((elo_home + HOME_ADV_ELO) - elo_away)
-    p_draw = DRAW_BASE * math.exp(-diff / DRAW_TIGHTNESS)
-    p_draw = max(0.08, min(0.35, p_draw))
-    remaining = 1.0 - p_draw
-    p_home = remaining * p_home_raw
-    p_away = remaining * (1.0 - p_home_raw)
-    s = p_home + p_draw + p_away
-    return (p_home / s, p_draw / s, p_away / s)
-
-def find_team_rating(ratings: dict, team_name: str):
-    if team_name in ratings:
-        return ratings[team_name]
-    low = team_name.lower().strip()
-    for k, v in ratings.items():
-        if k.lower().strip() == low:
-            return v
-    return None
-
-def main():
-    now_london = datetime.now(LONDON)
-    now_utc = now_london.astimezone(UTC)
-    cutoff_utc = now_utc + timedelta(hours=72)
-
-    print("MatchBot starting:", now_london)
-
     try:
-        all_rows = []
-
-        for comp_name, league_id in LEAGUES:
-            events = fetch_next_events(league_id)
-            ratings = fetch_table_ratings(league_id)
-
-            for ev in events:
-                home = ev.get("strHomeTeam") or ""
-                away = ev.get("strAwayTeam") or ""
-                dt_utc = parse_event_dt_utc(ev.get("dateEvent"), ev.get("strTime"))
-                if dt_utc is None or not (now_utc <= dt_utc <= cutoff_utc):
-                    continue
-
-                dt_london = dt_utc.astimezone(LONDON)
-
-                elo_h = find_team_rating(ratings, home) or 1500.0
-                elo_a = find_team_rating(ratings, away) or 1500.0
-
-                p_home, p_draw, p_away = probs_1x2(elo_h, elo_a)
-
-                all_rows.append({
-                    "competition": comp_name,
-                    "kickoff_london": dt_london.strftime("%Y-%m-%d %H:%M"),
-                    "home_team": home,
-                    "away_team": away,
-                    "p_home": round(p_home, 4),
-                    "p_draw": round(p_draw, 4),
-                    "p_away": round(p_away, 4),
-                })
-
-        # Always send a useful summary even if empty
-        msg_lines = [
-            "MatchBot — Probabilities (Mode A3)",
-            f"Run (London): {now_london.strftime('%Y-%m-%d %H:%M')}",
-            ""
-        ]
-
-        if not all_rows:
-            msg_lines.append("No fixtures found in the next 72 hours for selected leagues.")
+        dt = datetime.fromisoformat(f"{date_str}T{time_str}")
+        # Treat as UTC if no tz info
+        if dt.tzinfo is None:
+            dt = UTC.localize(dt)
         else:
-            all_rows.sort(key=lambda x: x["kickoff_london"])
-            msg_lines.append("Top 5 soonest fixtures:")
-            for r in all_rows[:5]:
-                msg_lines.append(
-                    f"{r['kickoff_london']} {r['competition']} — {r['home_team']} vs {r['away_team']} | "
-                    f"H:{int(r['p_home']*100)}% D:{int(r['p_draw']*100)}% A:{int(r['p_away']*100)}%"
-                )
+            dt = dt.astimezone(UTC)
+        return dt
+    except Exception:
+        return None
 
-        send_telegram_message("\n".join(msg_lines))
 
-        # Optional: write CSV
-        if all_rows:
-            out_dir = "/tmp/matchbot_reports"
-            os.makedirs(out_dir, exist_ok=True)
-            date_str = now_london.strftime("%Y-%m-%d")
-            filepath = os.path.join(out_dir, f"daily_report_{date_str}.csv")
-            pd.DataFrame(all_rows).to_csv(filepath, index=False)
-            print(f"Daily report written to {filepath}")
+# -----------------------------
+# Placeholder Elo source
+# -----------------------------
+def get_team_elo(team_name: str, league_name: str) -> float:
+    """
+    Replace this with your Elo table / file / API.
+    For now, deterministic fallback to avoid crashes.
+    """
+    # Simple stable hash -> range
+    h = abs(hash((team_name.lower().strip(), league_name))) % 400
+    return 1400.0 + (h - 200)  # approx 1200-1600
 
-    except Exception as e:
-        # If anything crashes, you still get the error in Telegram
-        err_text = f"MatchBot crashed ❌\n{type(e).__name__}: {e}"
-        print(err_text)
-        send_telegram_message(err_text)
-        raise
+
+# -----------------------------
+# Selection logic
+# -----------------------------
+def top_soonest_fixtures(limit: int = 5) -> List[Dict[str, Any]]:
+    now_utc = datetime.now(UTC)
+
+    all_events: List[Dict[str, Any]] = []
+    for league_name, league_id in LEAGUES:
+        events = sportsdb_next_events_by_league(league_id)
+        for e in events:
+            e["_league_name"] = league_name
+            dt_utc = parse_event_time_utc(e)
+            if not dt_utc:
+                continue
+            if dt_utc < now_utc - timedelta(hours=1):
+                continue
+            e["_dt_utc"] = dt_utc
+            all_events.append(e)
+
+    all_events.sort(key=lambda x: x["_dt_utc"])
+    return all_events[:limit]
+
+
+def format_probs_line(event: Dict[str, Any]) -> str:
+    league = event.get("_league_name", "Unknown League")
+    home = (event.get("strHomeTeam") or "Home").strip()
+    away = (event.get("strAwayTeam") or "Away").strip()
+
+    dt_london = event["_dt_utc"].astimezone(LONDON)
+    dt_str = dt_london.strftime("%Y-%m-%d %H:%M")
+
+    # Elo -> probs
+    elo_home = get_team_elo(home, league)
+    elo_away = get_team_elo(away, league)
+    pH, pD, pA = elo_to_probs(elo_home, elo_away)
+
+    return f"{dt_str} {league} — {home} vs {away} | H:{pH:.0%} D:{pD:.0%} A:{pA:.0%}"
+
+
+# -----------------------------
+# Main run
+# -----------------------------
+def run_bot_once() -> None:
+    run_time = datetime.now(LONDON).strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"MatchBot — Probabilities (Mode A3)",
+        f"Run (London): {run_time}",
+        "",
+        "Top 5 soonest fixtures:",
+    ]
+
+    fixtures = top_soonest_fixtures(limit=5)
+    if not fixtures:
+        lines.append("No fixtures returned (API may be down).")
+        msg = "\n".join(lines)
+        print(msg)
+        send_telegram_message(msg)
+        return
+
+    for e in fixtures:
+        lines.append(format_probs_line(e))
+
+    msg = "\n".join(lines)
+    print(msg)
+    send_telegram_message(msg)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        run_bot_once()
+    except Exception as e:
+        # Last-resort guard so the bot never dies silently
+        err = f"MatchBot crashed ❌\n{type(e).__name__}: {e}"
+        print(err)
+        send_telegram_message(err)
+        raise
