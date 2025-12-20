@@ -1,267 +1,363 @@
-print("DEPLOY MARKER: V123-CHAMP-001")
-
 import os
-import time
 import math
 import requests
 import pytz
-from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, List, Tuple
+from datetime import datetime, date
 
-# -----------------------------
-# Timezones
-# -----------------------------
+# ----------------------------
+# Config
+# ----------------------------
+DEPLOY_MARKER = "V300-AF+SPORTSDB-THU-SUN"
+
 LONDON = pytz.timezone("Europe/London")
 UTC = pytz.utc
 
-# -----------------------------
-# Leagues (TheSportsDB IDs)
-# -----------------------------
-LEAGUES: List[Tuple[str, int]] = [
-    ("Premier League", 4328),
-    ("EFL Championship", 4329),   # swapped from Champions League
+# Leagues we care about (names used for filtering SportsDB "eventsday")
+LEAGUES = [
+    ("Premier League", 39),        # API-Football league id
+    ("EFL Championship", 40),      # API-Football league id
 ]
 
-# -----------------------------
-# Model params
-# -----------------------------
+# Run only on Thu/Fri/Sat/Sun (London local)
+# Python weekday: Mon=0 ... Sun=6
+ALLOWED_WEEKDAYS = {3, 4, 5, 6}
+
+# Simple 1X2 model tuning
 HOME_ADV_ELO = 55
 DRAW_BASE = 0.24
 DRAW_TIGHTNESS = 260.0
 
-EDGE_THRESHOLD = 0.05
-MIN_PROB_TO_BET = 0.40
+TELEGRAM_MAX_LEN = 3800
 
-# -----------------------------
-# Odds API sport keys (if you use The Odds API)
-# -----------------------------
-ODDS_SPORT_KEYS = {
-    "Premier League": "soccer_epl",
-    "EFL Championship": "soccer_efl_championship",
-}
-
-# -----------------------------
-# Environment variables
-# -----------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-SPORTSDB_API_KEY = os.getenv("SPORTSDB_API_KEY", "1").strip()  # "1" is TheSportsDB test key (very limited)
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
-
-# -----------------------------
-# HTTP helpers (anti-crash)
-# -----------------------------
+# ----------------------------
+# Telegram
+# ----------------------------
 def send_telegram_message(text: str) -> None:
-    """
-    Sends a Telegram message if env vars are present.
-    Safe: never raises.
-    """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Telegram] Skipped (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID)")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("Telegram not configured (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID).")
+        print(text)
         return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-        requests.post(url, json=payload, timeout=15)
-    except Exception as e:
-        print("[Telegram] Send failed:", repr(e))
 
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-def safe_json(r: requests.Response, label: str) -> Optional[Dict[str, Any]]:
-    """
-    Robust JSON parsing:
-    - Logs status and response preview
-    - Returns None instead of raising
-    """
+    # Split long messages safely
+    chunks = []
+    t = (text or "").strip()
+    while len(t) > TELEGRAM_MAX_LEN:
+        cut = t.rfind("\n", 0, TELEGRAM_MAX_LEN)
+        if cut == -1:
+            cut = TELEGRAM_MAX_LEN
+        chunks.append(t[:cut].strip())
+        t = t[cut:].strip()
+    if t:
+        chunks.append(t)
+
+    for i, chunk in enumerate(chunks, start=1):
+        payload = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
+        r = requests.post(url, json=payload, timeout=25)
+        print(f"Telegram chunk {i}/{len(chunks)}:", r.status_code, r.text[:200])
+
+# ----------------------------
+# Model
+# ----------------------------
+def win_prob_from_elo(elo_a: float, elo_b: float) -> float:
+    return 1.0 / (1.0 + 10.0 ** ((elo_b - elo_a) / 400.0))
+
+def probs_1x2(elo_home: float, elo_away: float):
+    p_home_raw = win_prob_from_elo(elo_home + HOME_ADV_ELO, elo_away)
+    diff = abs((elo_home + HOME_ADV_ELO) - elo_away)
+
+    p_draw = DRAW_BASE * math.exp(-diff / DRAW_TIGHTNESS)
+    p_draw = max(0.08, min(0.35, p_draw))
+
+    remaining = 1.0 - p_draw
+    p_home = remaining * p_home_raw
+    p_away = remaining * (1.0 - p_home_raw)
+
+    s = p_home + p_draw + p_away
+    return (p_home / s, p_draw / s, p_away / s)
+
+def pct(x: float) -> str:
+    return f"{int(round(x * 100))}%"
+
+# ----------------------------
+# API-Football (RapidAPI)
+# ----------------------------
+RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "api-football-v1.p.rapidapi.com")
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+_SEASON_CACHE = {}
+
+def af_headers() -> dict:
+    if not RAPIDAPI_KEY:
+        raise RuntimeError("Missing RAPIDAPI_KEY env var")
+    return {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": RAPIDAPI_HOST,
+    }
+
+def api_get(path: str, params: dict) -> dict:
+    url = f"https://{RAPIDAPI_HOST}/v3{path}"
+    r = requests.get(url, headers=af_headers(), params=params, timeout=30)
+    if r.status_code != 200:
+        preview = (r.text or "")[:250].replace("\n", " ")
+        raise RuntimeError(f"API-Football failed {r.status_code} {path}: {preview}")
+    return r.json()
+
+def get_current_season(league_id: int) -> int:
+    if league_id in _SEASON_CACHE:
+        return _SEASON_CACHE[league_id]
+
+    data = api_get("/leagues", {"id": league_id})
+    resp = data.get("response") or []
+    if not resp:
+        raise RuntimeError(f"No league data for league id {league_id}")
+
+    seasons = (resp[0].get("seasons") or [])
+    current = next((s for s in seasons if s.get("current") is True), None)
+
+    if current and current.get("year"):
+        season_year = int(current["year"])
+    else:
+        years = [s.get("year") for s in seasons if s.get("year")]
+        if not years:
+            raise RuntimeError(f"Could not determine season for league id {league_id}")
+        season_year = int(max(years))
+
+    _SEASON_CACHE[league_id] = season_year
+    return season_year
+
+def fetch_fixtures_api_football(league_id: int, season: int, target_ymd: str):
+    data = api_get("/fixtures", {"league": league_id, "season": season, "date": target_ymd, "timezone": "UTC"})
+    resp = data.get("response") or []
+
+    out = []
+    for item in resp:
+        fx = item.get("fixture") or {}
+        teams = item.get("teams") or {}
+        goals = item.get("goals") or {}
+
+        kickoff_iso = fx.get("date")
+        if not kickoff_iso:
+            continue
+
+        kickoff_utc = datetime.fromisoformat(kickoff_iso.replace("Z", "+00:00")).astimezone(UTC)
+        kickoff_london = kickoff_utc.astimezone(LONDON)
+
+        status = (fx.get("status") or {}).get("short") or ""
+        home = ((teams.get("home") or {}).get("name")) or ""
+        away = ((teams.get("away") or {}).get("name")) or ""
+
+        out.append({
+            "kickoff_utc": kickoff_utc,
+            "kickoff_london": kickoff_london,
+            "home": home,
+            "away": away,
+            "status": status,
+            "home_goals": goals.get("home"),
+            "away_goals": goals.get("away"),
+            "source": "API-Football",
+        })
+
+    out.sort(key=lambda x: x["kickoff_utc"])
+    return out
+
+def fetch_standings_ratings_api_football(league_id: int, season: int) -> dict:
+    data = api_get("/standings", {"league": league_id, "season": season})
+    resp = data.get("response") or []
+    if not resp:
+        return {}
+
+    league = resp[0].get("league") or {}
+    standings = league.get("standings") or []
+    if not standings or not standings[0]:
+        return {}
+
+    rows = []
+    for row in standings[0]:
+        team = ((row.get("team") or {}).get("name")) or ""
+        all_stats = row.get("all") or {}
+        played = int(all_stats.get("played") or 0)
+        points = int(row.get("points") or 0)
+        gd = int(row.get("goalsDiff") or 0)
+        if not team or played <= 0:
+            continue
+        rows.append((team, points / played, gd / played))
+
+    if not rows:
+        return {}
+
+    avg_ppg = sum(x[1] for x in rows) / len(rows)
+    avg_gdpg = sum(x[2] for x in rows) / len(rows)
+
+    ratings = {}
+    for team, ppg, gdpg in rows:
+        elo = 1500 + (ppg - avg_ppg) * 420 + (gdpg - avg_gdpg) * 65
+        elo = max(1200, min(1800, elo))
+        ratings[team.strip().lower()] = float(elo)
+
+    return ratings
+
+def find_team_rating(ratings: dict, team_name: str):
+    if not team_name:
+        return None
+    return ratings.get(team_name.strip().lower())
+
+# ----------------------------
+# SportsDB (fallback)
+# ----------------------------
+SPORTSDB_KEY = os.environ.get("SPORTSDB_KEY", "1")  # if you have a better key, set it in Render
+SPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json"
+
+def sportsdb_get(path: str, params: dict) -> dict | None:
+    url = f"{SPORTSDB_BASE}/{SPORTSDB_KEY}/{path}"
     try:
+        r = requests.get(url, params=params, timeout=25)
+        if r.status_code != 200:
+            return None
         return r.json()
     except Exception:
-        preview = (r.text or "")[:350].replace("\n", " ")
-        print(f"[{label}] Non-JSON response")
-        print("Status:", r.status_code)
-        print("Preview:", preview)
         return None
 
-
-def get_with_retry(url: str, label: str, params: Optional[Dict[str, Any]] = None, tries: int = 3) -> Optional[Dict[str, Any]]:
+def fetch_fixtures_sportsdb_for_date(target_ymd: str, league_name: str):
     """
-    GET with retries + JSON safety.
-    Returns parsed JSON dict or None.
+    Uses eventsday.php to pull all soccer events for the day, then filters by strLeague.
+    This is a fallback only.
     """
-    last_r = None
-    for i in range(tries):
-        try:
-            last_r = requests.get(url, params=params, timeout=20)
-            # Basic sanity gates BEFORE json parsing
-            if last_r.status_code != 200:
-                print(f"[{label}] Bad status: {last_r.status_code} | URL: {last_r.url}")
-            if not last_r.text or not last_r.text.strip():
-                print(f"[{label}] Empty body | URL: {last_r.url}")
-            # Attempt JSON parse regardless; safe_json handles failures
-            data = safe_json(last_r, label)
-            if data is not None:
-                return data
-        except Exception as e:
-            print(f"[{label}] Request error:", repr(e))
-        time.sleep(2 * (i + 1))
-    return None
-
-
-# -----------------------------
-# Core model bits
-# -----------------------------
-def elo_to_probs(elo_home: float, elo_away: float) -> Tuple[float, float, float]:
-    """
-    Convert Elo difference to W/D/L probabilities with a draw model.
-    """
-    diff = (elo_home + HOME_ADV_ELO) - elo_away
-
-    # Win probability ignoring draws
-    p_home_nodraw = 1.0 / (1.0 + 10 ** (-diff / 400.0))
-    p_away_nodraw = 1.0 - p_home_nodraw
-
-    # Draw probability increases when teams are close
-    p_draw = DRAW_BASE * math.exp(-(abs(diff) / DRAW_TIGHTNESS))
-    p_draw = max(0.05, min(0.35, p_draw))  # clamp
-
-    # Re-scale win probs to fit remaining mass
-    rem = 1.0 - p_draw
-    p_home = p_home_nodraw * rem
-    p_away = p_away_nodraw * rem
-
-    # Normalize (numerical safety)
-    s = p_home + p_draw + p_away
-    p_home, p_draw, p_away = p_home / s, p_draw / s, p_away / s
-    return p_home, p_draw, p_away
-
-
-# -----------------------------
-# TheSportsDB: fixtures
-# -----------------------------
-def sportsdb_next_events_by_league(league_id: int) -> List[Dict[str, Any]]:
-    """
-    TheSportsDB endpoint: eventsnextleague.php?id=<league_id>
-    """
-    url = "https://www.thesportsdb.com/api/v1/json/{}/eventsnextleague.php".format(SPORTSDB_API_KEY)
-    data = get_with_retry(url, "TheSportsDB", params={"id": league_id})
+    data = sportsdb_get("eventsday.php", {"d": target_ymd, "s": "Soccer"})
     if not data:
         return []
+
     events = data.get("events") or []
-    if not isinstance(events, list):
-        return []
-    return events
+    out = []
+    for ev in events:
+        if (ev.get("strLeague") or "").strip().lower() != league_name.strip().lower():
+            continue
 
+        home = ev.get("strHomeTeam") or ""
+        away = ev.get("strAwayTeam") or ""
 
-def parse_event_time_utc(event: Dict[str, Any]) -> Optional[datetime]:
-    """
-    TheSportsDB typically provides dateEvent + strTime (often UTC).
-    We treat missing time as 00:00.
-    """
-    date_str = (event.get("dateEvent") or "").strip()  # e.g. "2025-12-20"
-    time_str = (event.get("strTime") or "").strip()    # e.g. "15:00:00"
-    if not date_str:
-        return None
-    if not time_str:
-        time_str = "00:00:00"
-    try:
-        dt = datetime.fromisoformat(f"{date_str}T{time_str}")
-        # Treat as UTC if no tz info
-        if dt.tzinfo is None:
-            dt = UTC.localize(dt)
-        else:
-            dt = dt.astimezone(UTC)
-        return dt
-    except Exception:
-        return None
+        # SportsDB uses dateEvent + strTime (often UTC-ish); treat as UTC if present
+        date_str = ev.get("dateEvent")
+        time_str = ev.get("strTime") or "00:00:00"
+        try:
+            kickoff_utc = UTC.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            continue
 
+        kickoff_london = kickoff_utc.astimezone(LONDON)
 
-# -----------------------------
-# Placeholder Elo source
-# -----------------------------
-def get_team_elo(team_name: str, league_name: str) -> float:
-    """
-    Replace this with your Elo table / file / API.
-    For now, deterministic fallback to avoid crashes.
-    """
-    # Simple stable hash -> range
-    h = abs(hash((team_name.lower().strip(), league_name))) % 400
-    return 1400.0 + (h - 200)  # approx 1200-1600
+        # Scores may exist if played
+        hg = ev.get("intHomeScore")
+        ag = ev.get("intAwayScore")
 
+        # status approximation
+        status = "FT" if (hg is not None and ag is not None) else "NS"
 
-# -----------------------------
-# Selection logic
-# -----------------------------
-def top_soonest_fixtures(limit: int = 5) -> List[Dict[str, Any]]:
-    now_utc = datetime.now(UTC)
+        out.append({
+            "kickoff_utc": kickoff_utc,
+            "kickoff_london": kickoff_london,
+            "home": home,
+            "away": away,
+            "status": status,
+            "home_goals": hg,
+            "away_goals": ag,
+            "source": "SportsDB",
+        })
 
-    all_events: List[Dict[str, Any]] = []
-    for league_name, league_id in LEAGUES:
-        events = sportsdb_next_events_by_league(league_id)
-        for e in events:
-            e["_league_name"] = league_name
-            dt_utc = parse_event_time_utc(e)
-            if not dt_utc:
-                continue
-            if dt_utc < now_utc - timedelta(hours=1):
-                continue
-            e["_dt_utc"] = dt_utc
-            all_events.append(e)
+    out.sort(key=lambda x: x["kickoff_utc"])
+    return out
 
-    all_events.sort(key=lambda x: x["_dt_utc"])
-    return all_events[:limit]
+# ----------------------------
+# Formatting
+# ----------------------------
+def fmt_score(status: str, hg, ag) -> str:
+    if hg is None and ag is None:
+        return ""
+    if status and status != "NS":
+        return f" [{hg}-{ag} {status}]"
+    return f" [{hg}-{ag}]"
 
+# ----------------------------
+# Main
+# ----------------------------
+def main():
+    now_london = datetime.now(LONDON)
 
-def format_probs_line(event: Dict[str, Any]) -> str:
-    league = event.get("_league_name", "Unknown League")
-    home = (event.get("strHomeTeam") or "Home").strip()
-    away = (event.get("strAwayTeam") or "Away").strip()
-
-    dt_london = event["_dt_utc"].astimezone(LONDON)
-    dt_str = dt_london.strftime("%Y-%m-%d %H:%M")
-
-    # Elo -> probs
-    elo_home = get_team_elo(home, league)
-    elo_away = get_team_elo(away, league)
-    pH, pD, pA = elo_to_probs(elo_home, elo_away)
-
-    return f"{dt_str} {league} — {home} vs {away} | H:{pH:.0%} D:{pD:.0%} A:{pA:.0%}"
-
-
-# -----------------------------
-# Main run
-# -----------------------------
-def run_bot_once() -> None:
-    run_time = datetime.now(LONDON).strftime("%Y-%m-%d %H:%M")
-    lines = [
-        f"MatchBot — Probabilities (Mode A3)",
-        f"Run (London): {run_time}",
-        "",
-        "Top 5 soonest fixtures:",
-    ]
-
-    fixtures = top_soonest_fixtures(limit=5)
-    if not fixtures:
-        lines.append("No fixtures returned (API may be down).")
-        msg = "\n".join(lines)
-        print(msg)
-        send_telegram_message(msg)
+    # Only run Thu/Fri/Sat/Sun
+    if now_london.weekday() not in ALLOWED_WEEKDAYS:
+        print(f"Skipping run (weekday {now_london.weekday()} not allowed).")
         return
 
-    for e in fixtures:
-        lines.append(format_probs_line(e))
+    target_ymd = now_london.strftime("%Y-%m-%d")
 
-    msg = "\n".join(lines)
-    print(msg)
-    send_telegram_message(msg)
+    msg_lines = [
+        "MatchBot — Fixtures & Results (Prem + Championship)",
+        f"Date (London): {target_ymd}",
+        f"Run (London): {now_london.strftime('%Y-%m-%d %H:%M')}",
+        f"Deploy: {DEPLOY_MARKER}",
+        "",
+    ]
 
+    any_found = 0
 
-if __name__ == "__main__":
     try:
-        run_bot_once()
+        for comp_name, league_id in LEAGUES:
+            # Primary: API-Football
+            fixtures = []
+            ratings = {}
+
+            api_ok = False
+            try:
+                season = get_current_season(league_id)
+                ratings = fetch_standings_ratings_api_football(league_id, season)
+                fixtures = fetch_fixtures_api_football(league_id, season, target_ymd)
+                api_ok = True
+            except Exception as e:
+                print(f"API-Football failed for {comp_name}: {type(e).__name__}: {e}")
+
+            # Fallback: SportsDB (fixtures only)
+            if not fixtures:
+                fixtures = fetch_fixtures_sportsdb_for_date(target_ymd, comp_name)
+
+            msg_lines.append(f"{comp_name}")
+            msg_lines.append(f"Source: {'API-Football' if api_ok else 'SportsDB / mixed'}")
+
+            if not fixtures:
+                msg_lines.append("No fixtures found.")
+                msg_lines.append("")
+                continue
+
+            for fx in fixtures:
+                home = fx["home"]
+                away = fx["away"]
+                t_str = fx["kickoff_london"].strftime("%H:%M")
+                status = fx["status"]
+                score_txt = fmt_score(status, fx["home_goals"], fx["away_goals"])
+
+                elo_h = find_team_rating(ratings, home) or 1500.0
+                elo_a = find_team_rating(ratings, away) or 1500.0
+                p_home, p_draw, p_away = probs_1x2(elo_h, elo_a)
+
+                msg_lines.append(
+                    f"{t_str} — {home} vs {away}{score_txt} | "
+                    f"H:{pct(p_home)} D:{pct(p_draw)} A:{pct(p_away)}"
+                )
+                any_found += 1
+
+            msg_lines.append("")
+
+        if any_found == 0:
+            msg_lines.append("No fixtures found today for the selected leagues.")
+
+        send_telegram_message("\n".join(msg_lines).strip())
+
     except Exception as e:
-        # Last-resort guard so the bot never dies silently
         err = f"MatchBot crashed ❌\n{type(e).__name__}: {e}"
         print(err)
         send_telegram_message(err)
         raise
+
+if __name__ == "__main__":
+    main()
