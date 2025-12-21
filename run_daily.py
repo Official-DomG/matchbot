@@ -42,7 +42,7 @@ SPORTSDB_LEAGUE_ID_FALLBACK = {
 # C4: CONFIDENCE FILTERING
 # =========================
 # Only send upcoming picks where max(H/D/A) >= this value.
-MIN_CONF_UPCOMING = float(os.environ.get("MIN_CONF_UPCOMING", "0.55"))  # 55% default
+MIN_CONF_UPCOMING = float(os.environ.get("MIN_CONF_UPCOMING", "0.60"))  # 55% default
 MAX_UPCOMING_POST = int(os.environ.get("MAX_UPCOMING_POST", "10"))      # cap message size
 
 # =========================
