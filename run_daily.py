@@ -1,186 +1,96 @@
 import os
 import math
 import requests
+import pandas as pd
 import pytz
-from datetime import datetime, date
+from datetime import datetime, timedelta, date
 
 # ----------------------------
 # Config
 # ----------------------------
-DEPLOY_MARKER = "V300-AF+SPORTSDB-THU-SUN"
+DEPLOY_MARKER = "V-C-RESULTS-THU-SUN-001"
 
 LONDON = pytz.timezone("Europe/London")
 UTC = pytz.utc
 
-# Leagues we care about (names used for filtering SportsDB "eventsday")
+# SportsDB League IDs (stable)
 LEAGUES = [
-    ("Premier League", 39),        # API-Football league id
-    ("EFL Championship", 40),      # API-Football league id
+    ("Premier League", 4328),
+    ("EFL Championship", 4329),
 ]
 
-# Run only on Thu/Fri/Sat/Sun (London local)
-# Python weekday: Mon=0 ... Sun=6
-ALLOWED_WEEKDAYS = {3, 4, 5, 6}
-
-# Simple 1X2 model tuning
+# Prob model tuning
 HOME_ADV_ELO = 55
 DRAW_BASE = 0.24
 DRAW_TIGHTNESS = 260.0
 
-TELEGRAM_MAX_LEN = 3800
+# ----------------------------
+# Helpers
+# ----------------------------
+def env(name: str, default: str = "") -> str:
+    return (os.environ.get(name) or default).strip()
 
-# ----------------------------
-# Telegram
-# ----------------------------
+def safe_int(x):
+    try:
+        if x is None or x == "":
+            return 0
+        return int(float(x))
+    except Exception:
+        return 0
+
+def get_json_or_none(r: requests.Response):
+    try:
+        return r.json()
+    except Exception:
+        preview = (r.text or "")[:200].replace("\n", " ")
+        print(f"Non-JSON response ({r.status_code}): {preview}")
+        return None
+
 def send_telegram_message(text: str) -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    token = env("TELEGRAM_BOT_TOKEN")
+    chat_id = env("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        print("Telegram not configured (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID).")
-        print(text)
+        print("Telegram not configured (missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
         return
-
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    r = requests.post(url, json=payload, timeout=20)
+    print("Telegram response:", r.status_code, r.text)
 
-    # Split long messages safely
-    chunks = []
-    t = (text or "").strip()
-    while len(t) > TELEGRAM_MAX_LEN:
-        cut = t.rfind("\n", 0, TELEGRAM_MAX_LEN)
-        if cut == -1:
-            cut = TELEGRAM_MAX_LEN
-        chunks.append(t[:cut].strip())
-        t = t[cut:].strip()
-    if t:
-        chunks.append(t)
+def sportsdb_base() -> str:
+    key = env("SPORTSDB_API_KEY", "1")
+    return f"https://www.thesportsdb.com/api/v1/json/{key}"
 
-    for i, chunk in enumerate(chunks, start=1):
-        payload = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
-        r = requests.post(url, json=payload, timeout=25)
-        print(f"Telegram chunk {i}/{len(chunks)}:", r.status_code, r.text[:200])
-
-# ----------------------------
-# Model
-# ----------------------------
-def win_prob_from_elo(elo_a: float, elo_b: float) -> float:
-    return 1.0 / (1.0 + 10.0 ** ((elo_b - elo_a) / 400.0))
-
-def probs_1x2(elo_home: float, elo_away: float):
-    p_home_raw = win_prob_from_elo(elo_home + HOME_ADV_ELO, elo_away)
-    diff = abs((elo_home + HOME_ADV_ELO) - elo_away)
-
-    p_draw = DRAW_BASE * math.exp(-diff / DRAW_TIGHTNESS)
-    p_draw = max(0.08, min(0.35, p_draw))
-
-    remaining = 1.0 - p_draw
-    p_home = remaining * p_home_raw
-    p_away = remaining * (1.0 - p_home_raw)
-
-    s = p_home + p_draw + p_away
-    return (p_home / s, p_draw / s, p_away / s)
-
-def pct(x: float) -> str:
-    return f"{int(round(x * 100))}%"
-
-# ----------------------------
-# API-Football (RapidAPI)
-# ----------------------------
-RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "api-football-v1.p.rapidapi.com")
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
-_SEASON_CACHE = {}
-
-def af_headers() -> dict:
-    if not RAPIDAPI_KEY:
-        raise RuntimeError("Missing RAPIDAPI_KEY env var")
-    return {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": RAPIDAPI_HOST,
-    }
-
-def api_get(path: str, params: dict) -> dict:
-    url = f"https://{RAPIDAPI_HOST}/v3{path}"
-    r = requests.get(url, headers=af_headers(), params=params, timeout=30)
+def sportsdb_get(path: str, params: dict):
+    url = f"{sportsdb_base()}/{path}"
+    r = requests.get(url, params=params, timeout=25)
     if r.status_code != 200:
-        preview = (r.text or "")[:250].replace("\n", " ")
-        raise RuntimeError(f"API-Football failed {r.status_code} {path}: {preview}")
-    return r.json()
+        print(f"SportsDB failed {r.status_code}: {url} params={params}")
+        return None
+    return get_json_or_none(r)
 
-def get_current_season(league_id: int) -> int:
-    if league_id in _SEASON_CACHE:
-        return _SEASON_CACHE[league_id]
+def fetch_events_by_day(league_id: int, day: date):
+    # Events for a given league on a given date
+    data = sportsdb_get("eventsday.php", {"d": day.strftime("%Y-%m-%d"), "l": str(league_id)})
+    if not data:
+        return []
+    return (data.get("events") or [])
 
-    data = api_get("/leagues", {"id": league_id})
-    resp = data.get("response") or []
-    if not resp:
-        raise RuntimeError(f"No league data for league id {league_id}")
-
-    seasons = (resp[0].get("seasons") or [])
-    current = next((s for s in seasons if s.get("current") is True), None)
-
-    if current and current.get("year"):
-        season_year = int(current["year"])
-    else:
-        years = [s.get("year") for s in seasons if s.get("year")]
-        if not years:
-            raise RuntimeError(f"Could not determine season for league id {league_id}")
-        season_year = int(max(years))
-
-    _SEASON_CACHE[league_id] = season_year
-    return season_year
-
-def fetch_fixtures_api_football(league_id: int, season: int, target_ymd: str):
-    data = api_get("/fixtures", {"league": league_id, "season": season, "date": target_ymd, "timezone": "UTC"})
-    resp = data.get("response") or []
-
-    out = []
-    for item in resp:
-        fx = item.get("fixture") or {}
-        teams = item.get("teams") or {}
-        goals = item.get("goals") or {}
-
-        kickoff_iso = fx.get("date")
-        if not kickoff_iso:
-            continue
-
-        kickoff_utc = datetime.fromisoformat(kickoff_iso.replace("Z", "+00:00")).astimezone(UTC)
-        kickoff_london = kickoff_utc.astimezone(LONDON)
-
-        status = (fx.get("status") or {}).get("short") or ""
-        home = ((teams.get("home") or {}).get("name")) or ""
-        away = ((teams.get("away") or {}).get("name")) or ""
-
-        out.append({
-            "kickoff_utc": kickoff_utc,
-            "kickoff_london": kickoff_london,
-            "home": home,
-            "away": away,
-            "status": status,
-            "home_goals": goals.get("home"),
-            "away_goals": goals.get("away"),
-            "source": "API-Football",
-        })
-
-    out.sort(key=lambda x: x["kickoff_utc"])
-    return out
-
-def fetch_standings_ratings_api_football(league_id: int, season: int) -> dict:
-    data = api_get("/standings", {"league": league_id, "season": season})
-    resp = data.get("response") or []
-    if not resp:
+def fetch_table_ratings(league_id: int) -> dict:
+    # League table -> derived Elo rating
+    data = sportsdb_get("lookuptable.php", {"l": str(league_id)})
+    if not data:
         return {}
-
-    league = resp[0].get("league") or {}
-    standings = league.get("standings") or []
-    if not standings or not standings[0]:
+    table = data.get("table") or []
+    if not table:
         return {}
 
     rows = []
-    for row in standings[0]:
-        team = ((row.get("team") or {}).get("name")) or ""
-        all_stats = row.get("all") or {}
-        played = int(all_stats.get("played") or 0)
-        points = int(row.get("points") or 0)
-        gd = int(row.get("goalsDiff") or 0)
+    for t in table:
+        team = (t.get("strTeam") or "").strip()
+        played = safe_int(t.get("intPlayed"))
+        points = safe_int(t.get("intPoints"))
+        gd = safe_int(t.get("intGoalDifference"))
         if not team or played <= 0:
             continue
         rows.append((team, points / played, gd / played))
@@ -195,169 +105,182 @@ def fetch_standings_ratings_api_football(league_id: int, season: int) -> dict:
     for team, ppg, gdpg in rows:
         elo = 1500 + (ppg - avg_ppg) * 420 + (gdpg - avg_gdpg) * 65
         elo = max(1200, min(1800, elo))
-        ratings[team.strip().lower()] = float(elo)
-
+        ratings[team] = float(elo)
     return ratings
 
-def find_team_rating(ratings: dict, team_name: str):
-    if not team_name:
+def win_prob_from_elo(elo_a: float, elo_b: float) -> float:
+    return 1.0 / (1.0 + 10.0 ** ((elo_b - elo_a) / 400.0))
+
+def probs_1x2(elo_home: float, elo_away: float):
+    p_home_raw = win_prob_from_elo(elo_home + HOME_ADV_ELO, elo_away)
+    diff = abs((elo_home + HOME_ADV_ELO) - elo_away)
+    p_draw = DRAW_BASE * math.exp(-diff / DRAW_TIGHTNESS)
+    p_draw = max(0.08, min(0.35, p_draw))
+    remaining = 1.0 - p_draw
+    p_home = remaining * p_home_raw
+    p_away = remaining * (1.0 - p_home_raw)
+    s = p_home + p_draw + p_away
+    return (p_home / s, p_draw / s, p_away / s)
+
+def parse_event_dt_london(ev: dict):
+    # SportsDB: dateEvent "YYYY-MM-DD", strTime usually "HH:MM:SS" (UTC-ish in many feeds).
+    # We treat it as UTC if time exists, then convert to London.
+    date_str = ev.get("dateEvent")
+    time_str = ev.get("strTime") or "00:00:00"
+    if not date_str:
         return None
-    return ratings.get(team_name.strip().lower())
-
-# ----------------------------
-# SportsDB (fallback)
-# ----------------------------
-SPORTSDB_KEY = os.environ.get("SPORTSDB_KEY", "1")  # if you have a better key, set it in Render
-SPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json"
-
-def sportsdb_get(path: str, params: dict) -> dict | None:
-    url = f"{SPORTSDB_BASE}/{SPORTSDB_KEY}/{path}"
     try:
-        r = requests.get(url, params=params, timeout=25)
-        if r.status_code != 200:
-            return None
-        return r.json()
+        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
+        dt_utc = UTC.localize(dt)
+        return dt_utc.astimezone(LONDON)
     except Exception:
         return None
 
-def fetch_fixtures_sportsdb_for_date(target_ymd: str, league_name: str):
-    """
-    Uses eventsday.php to pull all soccer events for the day, then filters by strLeague.
-    This is a fallback only.
-    """
-    data = sportsdb_get("eventsday.php", {"d": target_ymd, "s": "Soccer"})
-    if not data:
-        return []
+def event_is_played(ev: dict) -> bool:
+    # If scores exist, treat as played
+    hs = ev.get("intHomeScore")
+    aws = ev.get("intAwayScore")
+    return (hs is not None and hs != "") and (aws is not None and aws != "")
 
-    events = data.get("events") or []
-    out = []
-    for ev in events:
-        if (ev.get("strLeague") or "").strip().lower() != league_name.strip().lower():
-            continue
+def fmt_score(ev: dict) -> str:
+    hs = safe_int(ev.get("intHomeScore"))
+    aws = safe_int(ev.get("intAwayScore"))
+    return f"{hs}-{aws}"
 
-        home = ev.get("strHomeTeam") or ""
-        away = ev.get("strAwayTeam") or ""
-
-        # SportsDB uses dateEvent + strTime (often UTC-ish); treat as UTC if present
-        date_str = ev.get("dateEvent")
-        time_str = ev.get("strTime") or "00:00:00"
-        try:
-            kickoff_utc = UTC.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S"))
-        except Exception:
-            continue
-
-        kickoff_london = kickoff_utc.astimezone(LONDON)
-
-        # Scores may exist if played
-        hg = ev.get("intHomeScore")
-        ag = ev.get("intAwayScore")
-
-        # status approximation
-        status = "FT" if (hg is not None and ag is not None) else "NS"
-
-        out.append({
-            "kickoff_utc": kickoff_utc,
-            "kickoff_london": kickoff_london,
-            "home": home,
-            "away": away,
-            "status": status,
-            "home_goals": hg,
-            "away_goals": ag,
-            "source": "SportsDB",
-        })
-
-    out.sort(key=lambda x: x["kickoff_utc"])
-    return out
-
-# ----------------------------
-# Formatting
-# ----------------------------
-def fmt_score(status: str, hg, ag) -> str:
-    if hg is None and ag is None:
-        return ""
-    if status and status != "NS":
-        return f" [{hg}-{ag} {status}]"
-    return f" [{hg}-{ag}]"
+def end_of_sunday_london(now_london: datetime) -> datetime:
+    # Sunday = 6 when Monday=0
+    days_until_sun = (6 - now_london.weekday()) % 7
+    sun = (now_london + timedelta(days=days_until_sun)).date()
+    # 23:59:59 London
+    return LONDON.localize(datetime(sun.year, sun.month, sun.day, 23, 59, 59))
 
 # ----------------------------
 # Main
 # ----------------------------
 def main():
     now_london = datetime.now(LONDON)
+    print(f"DEPLOY MARKER: {DEPLOY_MARKER}")
+    print("MatchBot starting (London):", now_london)
 
-    # Only run Thu/Fri/Sat/Sun
-    if now_london.weekday() not in ALLOWED_WEEKDAYS:
-        print(f"Skipping run (weekday {now_london.weekday()} not allowed).")
+    # Safety guard: only do work Thu-Sun (Thu=3, Fri=4, Sat=5, Sun=6)
+    if now_london.weekday() not in (3, 4, 5, 6):
+        print("Not a Thu–Sun run day. Exiting cleanly.")
         return
 
-    target_ymd = now_london.strftime("%Y-%m-%d")
+    window_end = end_of_sunday_london(now_london)
 
-    msg_lines = [
-        "MatchBot — Fixtures & Results (Prem + Championship)",
-        f"Date (London): {target_ymd}",
-        f"Run (London): {now_london.strftime('%Y-%m-%d %H:%M')}",
-        f"Deploy: {DEPLOY_MARKER}",
-        "",
-    ]
+    # We build:
+    # - upcoming fixtures: now -> Sunday end
+    # - results: yesterday + today
+    today = now_london.date()
+    yesterday = today - timedelta(days=1)
 
-    any_found = 0
+    upcoming_rows = []
+    results_rows = []
 
+    for comp_name, league_id in LEAGUES:
+        ratings = fetch_table_ratings(league_id)
+
+        # Pull events day-by-day across the window (keeps it simple + reliable)
+        cursor = today
+        while cursor <= window_end.date():
+            events = fetch_events_by_day(league_id, cursor)
+
+            for ev in events:
+                home = (ev.get("strHomeTeam") or "").strip()
+                away = (ev.get("strAwayTeam") or "").strip()
+                if not home or not away:
+                    continue
+
+                dt_london = parse_event_dt_london(ev)
+                if not dt_london:
+                    # fallback: date-only
+                    dt_london = LONDON.localize(datetime(cursor.year, cursor.month, cursor.day, 12, 0, 0))
+
+                # RESULTS bucket (yesterday + today, only if played)
+                if cursor in (yesterday, today) and event_is_played(ev):
+                    results_rows.append({
+                        "competition": comp_name,
+                        "kickoff_london": dt_london.strftime("%Y-%m-%d %H:%M"),
+                        "home_team": home,
+                        "away_team": away,
+                        "score": fmt_score(ev),
+                    })
+
+                # UPCOMING bucket (now -> end of Sunday, only if not played)
+                if (now_london <= dt_london <= window_end) and (not event_is_played(ev)):
+                    elo_h = ratings.get(home, 1500.0)
+                    elo_a = ratings.get(away, 1500.0)
+                    p_home, p_draw, p_away = probs_1x2(elo_h, elo_a)
+
+                    upcoming_rows.append({
+                        "competition": comp_name,
+                        "kickoff_london": dt_london.strftime("%Y-%m-%d %H:%M"),
+                        "home_team": home,
+                        "away_team": away,
+                        "p_home": round(p_home, 4),
+                        "p_draw": round(p_draw, 4),
+                        "p_away": round(p_away, 4),
+                    })
+
+            cursor += timedelta(days=1)
+
+    # Sort outputs
+    upcoming_rows.sort(key=lambda x: x["kickoff_london"])
+    results_rows.sort(key=lambda x: x["kickoff_london"], reverse=True)
+
+    # Build Telegram message (single message per run)
+    msg = []
+    msg.append("MatchBot — Fixtures + Results (Thu–Sun)")
+    msg.append(f"Run (London): {now_london.strftime('%Y-%m-%d %H:%M')}")
+    msg.append(f"Window: now → {window_end.strftime('%a %Y-%m-%d %H:%M')} (London)")
+    msg.append(f"Deploy: {DEPLOY_MARKER}")
+    msg.append("")
+
+    # Results section
+    msg.append("RESULTS (yesterday + today):")
+    if results_rows:
+        # show up to 12 results
+        for r in results_rows[:12]:
+            msg.append(f"- {r['kickoff_london']} {r['competition']} — {r['home_team']} {r['score']} {r['away_team']}")
+    else:
+        msg.append("- No completed matches found (yet).")
+    msg.append("")
+
+    # Upcoming section (with probabilities)
+    msg.append("UPCOMING (now → Sunday):")
+    if upcoming_rows:
+        # show up to 12 upcoming
+        for r in upcoming_rows[:12]:
+            msg.append(
+                f"- {r['kickoff_london']} {r['competition']} — {r['home_team']} vs {r['away_team']} | "
+                f"H:{int(r['p_home']*100)}% D:{int(r['p_draw']*100)}% A:{int(r['p_away']*100)}%"
+            )
+    else:
+        msg.append("- No upcoming fixtures found in the window.")
+    msg.append("")
+
+    send_telegram_message("\n".join(msg).strip())
+
+    # Optional: write CSV report for debugging
     try:
-        for comp_name, league_id in LEAGUES:
-            # Primary: API-Football
-            fixtures = []
-            ratings = {}
+        out_dir = "/tmp/matchbot_reports"
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = now_london.strftime("%Y-%m-%d")
+        if upcoming_rows:
+            pd.DataFrame(upcoming_rows).to_csv(os.path.join(out_dir, f"upcoming_{stamp}.csv"), index=False)
+        if results_rows:
+            pd.DataFrame(results_rows).to_csv(os.path.join(out_dir, f"results_{stamp}.csv"), index=False)
+        print("CSV reports written to", out_dir)
+    except Exception as e:
+        print("CSV write skipped:", type(e).__name__, str(e))
 
-            api_ok = False
-            try:
-                season = get_current_season(league_id)
-                ratings = fetch_standings_ratings_api_football(league_id, season)
-                fixtures = fetch_fixtures_api_football(league_id, season, target_ymd)
-                api_ok = True
-            except Exception as e:
-                print(f"API-Football failed for {comp_name}: {type(e).__name__}: {e}")
-
-            # Fallback: SportsDB (fixtures only)
-            if not fixtures:
-                fixtures = fetch_fixtures_sportsdb_for_date(target_ymd, comp_name)
-
-            msg_lines.append(f"{comp_name}")
-            msg_lines.append(f"Source: {'API-Football' if api_ok else 'SportsDB / mixed'}")
-
-            if not fixtures:
-                msg_lines.append("No fixtures found.")
-                msg_lines.append("")
-                continue
-
-            for fx in fixtures:
-                home = fx["home"]
-                away = fx["away"]
-                t_str = fx["kickoff_london"].strftime("%H:%M")
-                status = fx["status"]
-                score_txt = fmt_score(status, fx["home_goals"], fx["away_goals"])
-
-                elo_h = find_team_rating(ratings, home) or 1500.0
-                elo_a = find_team_rating(ratings, away) or 1500.0
-                p_home, p_draw, p_away = probs_1x2(elo_h, elo_a)
-
-                msg_lines.append(
-                    f"{t_str} — {home} vs {away}{score_txt} | "
-                    f"H:{pct(p_home)} D:{pct(p_draw)} A:{pct(p_away)}"
-                )
-                any_found += 1
-
-            msg_lines.append("")
-
-        if any_found == 0:
-            msg_lines.append("No fixtures found today for the selected leagues.")
-
-        send_telegram_message("\n".join(msg_lines).strip())
-
+if __name__ == "__main__":
+    try:
+        main()
+        print("MatchBot finished successfully")
     except Exception as e:
         err = f"MatchBot crashed ❌\n{type(e).__name__}: {e}"
         print(err)
         send_telegram_message(err)
         raise
-
-if __name__ == "__main__":
-    main()
