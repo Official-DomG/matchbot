@@ -1,3 +1,2 @@
-requests
-pytz
-pandas
+requests==2.32.3
+pytz==2025.2
