@@ -27,6 +27,31 @@ DRAW_TIGHTNESS = 260.0
 # ----------------------------
 # Helpers
 # ----------------------------
+def confidence_tier(p_home: float, p_draw: float, p_away: float, elo_diff: float):
+    """
+    Returns (tier, reason_string)
+    Tier: HIGH / MEDIUM / LOW
+    Reason: quick explanation so the message isn't a black box
+    """
+
+    # main outcome probability (ignore draw for "winner confidence")
+    p_best_side = max(p_home, p_away)
+    fav = "HOME" if p_home >= p_away else "AWAY"
+
+    # simple, robust rules:
+    # - HIGH: strong favorite + draw not too high + elo gap meaningful
+    # - MEDIUM: moderate favorite or draw somewhat high
+    # - LOW: messy match / draw-heavy / close teams
+    #
+    # These are intentionally conservative.
+
+    if (p_best_side >= 0.60) and (p_draw <= 0.25) and (abs(elo_diff) >= 80):
+        return "HIGH", f"{fav} favored (P={p_best_side:.0%}, D={p_draw:.0%}, EloΔ={elo_diff:.0f})"
+
+    if (p_best_side >= 0.52) and (p_draw <= 0.30) and (abs(elo_diff) >= 40):
+        return "MEDIUM", f"{fav} lean (P={p_best_side:.0%}, D={p_draw:.0%}, EloΔ={elo_diff:.0f})"
+
+    return "LOW", f"High variance (Best={p_best_side:.0%}, D={p_draw:.0%}, EloΔ={elo_diff:.0f})"
 def env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
 
