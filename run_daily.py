@@ -460,4 +460,47 @@ def main():
         lines.append("- No matches to evaluate in this results window.")
     else:
         acc = (correct_eval / total_eval) * 100.0
-        lines.append(f"- Accuracy (this window): {correct_eval}/{total_eval} = {
+        lines.append(f"- Accuracy (this window): {correct_eval}/{total_eval} = {acc:.1f}%")
+
+        # Optional: show the last 10 evaluated matches
+        lines.append("")
+        lines.append("Last 10 evaluated matches:")
+        for e in eval_rows[-10:]:
+            lines.append(
+                f"- {e['kickoff_london']} {e['league']} — {e['home']} {e['score']} {e['away']} | "
+                f"Pick:{e['model_pick']} Actual:{e['actual']} Hit:{e['hit']}"
+            )
+
+    lines.append("")
+    # UPCOMING block
+    lines.append("UPCOMING (now → Sunday):")
+    if not upcoming_rows:
+        lines.append("- No upcoming fixtures found in the window.")
+    else:
+        for u in upcoming_rows[:25]:
+            lines.append(
+                f"- {u['kickoff_london']} {u['league']} — {u['home']} vs {u['away']} | "
+                f"H:{int(u['p_home']*100)}% D:{int(u['p_draw']*100)}% A:{int(u['p_away']*100)}% | "
+                f"Pick:{u['pick']}"
+            )
+
+    # Send Telegram output
+    send_telegram_chunks("\n".join(lines))
+
+    # Write CSVs
+    out_dir = "/tmp/matchbot_reports"
+    date_tag = now_london.strftime("%Y-%m-%d")
+    write_csv(upcoming_rows, f"{out_dir}/upcoming_{date_tag}.csv")
+    write_csv(result_rows,   f"{out_dir}/results_{date_tag}.csv")
+    write_csv(eval_rows,     f"{out_dir}/eval_{date_tag}.csv")
+    print("CSV reports written to", out_dir)
+
+if __name__ == "__main__":
+    try:
+        main()
+        print("MatchBot finished successfully")
+    except Exception as e:
+        err = f"MatchBot crashed ❌\n{type(e).__name__}: {e}"
+        print(err)
+        send_telegram_chunks(err)
+        raise
