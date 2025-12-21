@@ -273,14 +273,19 @@ def main():
     msg.append("")
 
     # Upcoming section (with probabilities)
-    msg.append("UPCOMING (now → Sunday):")
-    if upcoming_rows:
-        # show up to 12 upcoming
-        for r in upcoming_rows[:12]:
-            msg.append(
-                f"- {r['kickoff_london']} {r['competition']} — {r['home_team']} vs {r['away_team']} | "
-                f"H:{int(r['p_home']*100)}% D:{int(r['p_draw']*100)}% A:{int(r['p_away']*100)}%"
-            )
+    msg_lines.append("UPCOMING (now → Sunday):")
+
+# Sort: HIGH first, then MEDIUM, then LOW, then by kickoff
+tier_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+upcoming.sort(key=lambda r: (tier_order.get(r.get("confidence","LOW"), 9), r["kickoff_london"]))
+
+for r in upcoming[:12]:  # cap to avoid mega-messages
+    msg_lines.append(
+        f"- [{r.get('confidence','LOW')}] {r['kickoff_london']} {r['league']} — "
+        f"{r['home_team']} vs {r['away_team']} | "
+        f"H:{int(r['p_home']*100)}% D:{int(r['p_draw']*100)}% A:{int(r['p_away']*100)}% "
+        f"({r.get('confidence_reason','')})"
+    )
     else:
         msg.append("- No upcoming fixtures found in the window.")
     msg.append("")
