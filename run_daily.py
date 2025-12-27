@@ -641,7 +641,6 @@ def main():
     now_london = datetime.now(LONDON)
     now_utc = now_london.astimezone(UTC)
     wd = now_london.weekday()
-
     header_lines = [
         "MatchBot C4 - Thu-Sun + Live + Eval + Fallback (ASCII)",
         "Run (London): {}".format(now_london.strftime("%Y-%m-%d %H:%M")),
